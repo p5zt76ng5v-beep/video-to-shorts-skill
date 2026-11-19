@@ -18,7 +18,10 @@ clips.json (the agent writes it after reading work/transcript.txt):
 }
 
 reframe: "auto" (face crop when OpenCV finds one speaker, else fit), "face", "center",
-  "fit" (whole frame on a blurred copy of itself: two speakers, screen shares, wide shots).
+  "fit" (whole frame on a blurred copy of itself: two speakers, screen shares, wide shots),
+  "split" (streams and gaming: the facecam on top, the gameplay below; needs "facecam").
+facecam: [x, y, w, h] of the webcam box in source pixels, for "split". focus_x then places the
+  gameplay crop; the hook sits on the seam between the two panels.
 focus_x: 0 to 1, sets the crop by hand. zoom: punch-in for crops (default 1.1).
 cut: source-time ranges to remove inside the clip (a ramble, a "kind of").
 tighten: remove pauses over 0.45 s, including silences the transcriber hides inside long words.
@@ -174,14 +177,14 @@ def keep_spans(marked, a, b, tighten):
             prev_removed = True
             continue
         if cur is None:
-            cur = [max(a, w["start"] - pad), w["end"]]
+            cur = [max(a, w["start"] - pad) if tighten else a, w["end"]]  # untightened: keep the lead-in (gameplay, b-roll)
         elif prev_removed or w["start"] - cur[1] > max_gap:
             spans.append((cur[0], cur[1] + pad))
             cur = [w["start"] - pad, w["end"]]
         else:
             cur[1] = max(cur[1], w["end"])
         prev_removed = False
-    spans.append((cur[0], min(b + 0.3, cur[1] + 0.25)))  # a little air after the last word
+    spans.append((cur[0], min(b + 0.3, cur[1] + 0.25) if tighten else max(b, cur[1] + 0.25)))  # a little air after the last word
     merged = []
     for s, e in spans:
         if merged and s <= merged[-1][1]:
@@ -237,6 +240,10 @@ def choose_frame(clip, src_w, src_h, path):
         return "crop", 0.5
     if mode == "fit":
         return "fit", 0.5
+    if mode == "split":
+        if not clip.get("facecam"):
+            sys.exit(f"clip {clip['id']}: \"split\" needs \"facecam\": [x, y, w, h] in source pixels")
+        return "split", (float(clip.get("focus_x", 0.5)), [int(v) for v in clip["facecam"]])
     found = detect_faces(path, float(clip["start"]), float(clip["end"]))
     if found is None:
         if mode == "face":
@@ -252,8 +259,30 @@ def choose_frame(clip, src_w, src_h, path):
     return "crop", one[len(one) // 2]
 
 
+def split_heights(cam):
+    """Top (facecam) and bottom (gameplay) panel heights for the split layout."""
+    top = min(max(int(round(W * cam[3] / cam[2] / 2)) * 2, 480), 860)
+    return top, H - top
+
+
+def split_game_box(focus, src_w, src_h, zoom):
+    fx, cam = focus
+    gh = int(src_h / zoom) // 2 * 2
+    gw = min(int(gh * W / split_heights(cam)[1]) // 2 * 2, src_w // 2 * 2)
+    x = int(min(max(fx * src_w - gw / 2, 0), src_w - gw))
+    y = int((src_h - gh) / 2) // 2 * 2
+    return gw, gh, x, y
+
+
 def frame_filter(kind, focus, src_w, src_h, zoom, tag):
     """Filter chain from a span's frames to 1080x1920. zoom > 1 punches in, eyes kept level."""
+    if kind == "split":
+        cam = focus[1]
+        top, bottom = split_heights(cam)
+        gw, gh, gx, gy = split_game_box(focus, src_w, src_h, zoom)
+        return (f"split=2[ct{tag}][gp{tag}];[ct{tag}]crop={cam[2]}:{cam[3]}:{cam[0]}:{cam[1]},"
+                f"scale={W}:{top}:flags=lanczos,setsar=1[cs{tag}];[gp{tag}]crop={gw}:{gh}:{gx}:{gy},"
+                f"scale={W}:{bottom}:flags=lanczos,setsar=1[gs{tag}];[cs{tag}][gs{tag}]vstack")
     if kind == "vertical":
         return f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
     if kind == "crop":
@@ -401,10 +430,12 @@ def caption_groups(kept, upper):
     return [g for g in groups if g]
 
 
-def build_overlays(clip, marked, spans, style, length, frame_kind, tmp):
+def build_overlays(clip, marked, spans, style, length, frame_kind, tmp, focus=None):
     """Write PNG overlays plus an ffmpeg concat list that shows each one for the right time."""
     upper = style.get("uppercase", False)
     cap_y = int(style.get("caption_y", 1230))
+    if frame_kind == "split" and "caption_y" not in style:
+        cap_y = min(split_heights(focus[1])[0] + 520, 1250)  # upper gameplay, clear of the game's own subtitles
     cap_top = cap_y - int(CAP_SIZE * 1.18)
     hook = clip.get("hook") if style.get("hook", True) else None
     kept = [dict(w) for w, r in marked if not r]
@@ -425,6 +456,8 @@ def build_overlays(clip, marked, spans, style, length, frame_kind, tmp):
             hook_windows.append((mid, min(mid + 2.0, length)))
     # crop: hook sits just above the captions (the face fills the top); fit: at the top
     hook_top = 330 if frame_kind == "fit" else None
+    if frame_kind == "split":
+        hook_top = split_heights(focus[1])[0] - 70  # straddles the seam, off the streamer's face
     hook_bottom = cap_top - 36
     events = []
     timed = [[(to_output_time(w["start"], spans), to_output_time(w["end"], spans), w["w"]) for w in g]
@@ -494,12 +527,12 @@ def render_clip(clip, src, words, style, tmp, out_dir, src_w, src_h, fps):
     if kind == "crop" and src_h * W / H / zoom < W * 0.5:
         warn(f"clip {clip['id']}: a {src_h}p source is enlarged about {H * zoom / src_h:.1f}x in a crop; "
              "it will look soft. Use \"reframe\": \"fit\" or a bigger source")
-    overlay_list = build_overlays(clip, marked, spans, style, length, kind, tmp)
+    overlay_list = build_overlays(clip, marked, spans, style, length, kind, tmp, focus)
     seek = max(0.0, a - 3)
     parts, labels = [], []
     for i, (s, e) in enumerate(spans):
         # alternate a slight punch-in at every cut, so removed pauses read as edits, not glitches
-        z = zoom * (1.12 if (kind == "crop" and i % 2 == 1) else 1.0)
+        z = zoom * (1.12 if (kind in ("crop", "split") and clip.get("tighten", True) and i % 2 == 1) else 1.0)
         fade_out = 0.08 if i == len(spans) - 1 else 0.01
         parts.append(f"[0:v]trim=start={s - seek:.3f}:end={e - seek:.3f},setpts=PTS-STARTPTS,"
                      f"{frame_filter(kind, focus, src_w, src_h, z, i)},setsar=1[v{i}];"
@@ -545,6 +578,12 @@ def preview(clip, words, src, src_w, src_h, out_dir):
             x = min(max(focus * src_w - cw / 2, 0), src_w - cw)
             y = min(max(EYE_LINE * src_h * (1 - 1 / zoom), 0), src_h - ch)
             ImageDraw.Draw(im).rectangle([x, y, x + cw, y + ch], outline=(255, 212, 59), width=max(4, src_w // 240))
+        elif kind == "split":
+            gw, gh, gx, gy = split_game_box(focus, src_w, src_h, zoom)
+            cx, cy, cw, ch = focus[1]
+            d = ImageDraw.Draw(im)
+            d.rectangle([cx, cy, cx + cw, cy + ch], outline=(80, 200, 255), width=max(4, src_w // 240))
+            d.rectangle([gx, gy, gx + gw, gy + gh], outline=(255, 212, 59), width=max(4, src_w // 240))
         frames.append(im.resize((640, int(640 * src_h / src_w))))
         os.remove(p)
     sheet = Image.new("RGB", (640 * 3 + 20, frames[0].height), "#222222")
@@ -554,6 +593,7 @@ def preview(clip, words, src, src_w, src_h, out_dir):
     sheet.save(path, quality=85)
     kept = [w["w"] for w, r in marked if not r]
     print(f"  clip {clip['id']}: {kind}" + (f" focus_x={focus:.2f}" if kind == "crop" else "")
+          + (f" focus_x={focus[0]:.2f} facecam={focus[1]}" if kind == "split" else "")
           + f", {length:.1f} s after tightening -> {path}")
     print(f"     starts: \"{' '.join(kept[:8])} ...\"")
     print(f"     ends:   \"... {' '.join(kept[-8:])}\"")
