@@ -45,6 +45,7 @@ HOOK_SIZE = 78
 HOOK_SECONDS = 3.5
 EYE_LINE = 0.38        # eyes sit about here in a typical talking-head frame
 BEST = False           # --best: slower encode, slightly smaller files at the same quality
+SHARPEN = 0.0          # style "sharpen": 0 to 1.5, clean up and sharpen a soft or low-bitrate source
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "..", "fonts")
 FONT_FILES = ["Poppins-ExtraBold.ttf", "Poppins-Bold.ttf"]
@@ -280,9 +281,14 @@ def frame_filter(kind, focus, src_w, src_h, zoom, tag):
         cam = focus[1]
         top, bottom = split_heights(cam)
         gw, gh, gx, gy = split_game_box(focus, src_w, src_h, zoom)
+        # the facecam is enlarged far more than the gameplay, so it gets the stronger clean-up
+        cam_fx = (f"hqdn3d=1.5:1.5:4:4,scale={W}:{top}:flags=lanczos,unsharp=5:5:{1.2 * SHARPEN:.2f}:5:5:0"
+                  if SHARPEN else f"scale={W}:{top}:flags=lanczos")
+        game_fx = (f"hqdn3d=1:1:3:3,scale={W}:{bottom}:flags=lanczos,unsharp=5:5:{0.8 * SHARPEN:.2f}:5:5:0"
+                   if SHARPEN else f"scale={W}:{bottom}:flags=lanczos")
         return (f"split=2[ct{tag}][gp{tag}];[ct{tag}]crop={cam[2]}:{cam[3]}:{cam[0]}:{cam[1]},"
-                f"scale={W}:{top}:flags=lanczos,setsar=1[cs{tag}];[gp{tag}]crop={gw}:{gh}:{gx}:{gy},"
-                f"scale={W}:{bottom}:flags=lanczos,setsar=1[gs{tag}];[cs{tag}][gs{tag}]vstack")
+                f"{cam_fx},setsar=1[cs{tag}];[gp{tag}]crop={gw}:{gh}:{gx}:{gy},"
+                f"{game_fx},setsar=1[gs{tag}];[cs{tag}][gs{tag}]vstack")
     if kind == "vertical":
         return f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
     if kind == "crop":
@@ -290,7 +296,8 @@ def frame_filter(kind, focus, src_w, src_h, zoom, tag):
         cw = int(ch * W / H) // 2 * 2
         x = int(min(max(focus * src_w - cw / 2, 0), src_w - cw))
         y = int(min(max(EYE_LINE * src_h * (1 - 1 / zoom), 0), src_h - ch))
-        return f"crop={cw}:{ch}:{x}:{y},scale={W}:{H}:flags=lanczos"
+        sharp = f",unsharp=5:5:{0.8 * SHARPEN:.2f}:5:5:0" if SHARPEN else ""
+        return f"crop={cw}:{ch}:{x}:{y}," + (f"hqdn3d=1:1:3:3," if SHARPEN else "") + f"scale={W}:{H}:flags=lanczos{sharp}"
     return (f"split=2[bg{tag}][fg{tag}];[bg{tag}]scale={W}:{H}:force_original_aspect_ratio=increase,"
             f"crop={W}:{H},gblur=sigma=40,eq=brightness=-0.15[bgb{tag}];[fg{tag}]scale={W}:-2[fgs{tag}];"
             f"[bgb{tag}][fgs{tag}]overlay=(W-w)/2:min((H-h)/2\\,470)")
@@ -549,8 +556,8 @@ def render_clip(clip, src, words, style, tmp, out_dir, src_w, src_h, fps):
     run(["ffmpeg", "-y", "-v", "error", "-ss", f"{seek:.3f}", "-t", f"{b - seek + 1:.3f}",
          "-i", os.path.abspath(src), "-f", "concat", "-safe", "0", "-i", overlay_list,
          "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
-         "-c:v", "libx264", "-preset", "medium" if BEST else "veryfast", "-crf", "19" if BEST else "20",
-         "-profile:v", "high", "-maxrate", "12M", "-bufsize", "24M", "-g", "60", "-keyint_min", "30",
+         "-c:v", "libx264", "-preset", "medium" if BEST else "veryfast", "-crf", "17" if (BEST and SHARPEN) else "19" if BEST else "20",
+         "-profile:v", "high", "-maxrate", "20M" if SHARPEN else "12M", "-bufsize", "40M" if SHARPEN else "24M", "-g", "60", "-keyint_min", "30",
          "-bf", "2", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
          "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-movflags", "+faststart", out], cwd=tmp)
     cover = os.path.join(out_dir, f"clip-{clip['id']}-cover.jpg")
@@ -632,6 +639,8 @@ def main():
     global BEST
     BEST = a.best
     spec = json.load(open(a.clips, encoding="utf-8"))
+    global SHARPEN
+    SHARPEN = float(spec.get("style", {}).get("sharpen", 0) or 0)
     base = os.path.dirname(os.path.abspath(a.clips))
     src = spec["video"] if os.path.isabs(spec["video"]) else os.path.join(base, spec["video"])
     if not os.path.exists(src):
