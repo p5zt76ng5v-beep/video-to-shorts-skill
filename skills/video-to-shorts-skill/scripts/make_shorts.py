@@ -20,7 +20,8 @@ clips.json (the agent writes it after reading work/transcript.txt):
 reframe: "auto" (face crop when OpenCV finds one speaker, else fit), "face", "center",
   "fit" (whole frame on a blurred copy of itself: two speakers, screen shares, wide shots),
   "split" (streams and gaming: the facecam on top, the gameplay below; needs "facecam").
-facecam: [x, y, w, h] of the webcam box in source pixels, for "split". focus_x then places the
+facecam: [x, y, w, h] of the webcam box in source pixels, for "split". facecam_scale: 0.4 to 1,
+  shows a small or soft webcam smaller, centred on a blurred copy of itself (default 1, full width). focus_x then places the
   gameplay crop; the hook sits on the seam between the two panels.
 focus_x: 0 to 1, sets the crop by hand. zoom: punch-in for crops (default 1.1).
 cut: source-time ranges to remove inside the clip (a ramble, a "kind of").
@@ -244,7 +245,8 @@ def choose_frame(clip, src_w, src_h, path):
     if mode == "split":
         if not clip.get("facecam"):
             sys.exit(f"clip {clip['id']}: \"split\" needs \"facecam\": [x, y, w, h] in source pixels")
-        return "split", (float(clip.get("focus_x", 0.5)), [int(v) for v in clip["facecam"]])
+        return "split", (float(clip.get("focus_x", 0.5)), [int(v) for v in clip["facecam"]],
+                         min(max(float(clip.get("facecam_scale", 1.0)), 0.4), 1.0))
     found = detect_faces(path, float(clip["start"]), float(clip["end"]))
     if found is None:
         if mode == "face":
@@ -267,7 +269,7 @@ def split_heights(cam):
 
 
 def split_game_box(focus, src_w, src_h, zoom):
-    fx, cam = focus
+    fx, cam = focus[0], focus[1]
     gh = int(src_h / zoom) // 2 * 2
     gw = min(int(gh * W / split_heights(cam)[1]) // 2 * 2, src_w // 2 * 2)
     x = int(min(max(fx * src_w - gw / 2, 0), src_w - gw))
@@ -284,6 +286,12 @@ def frame_filter(kind, focus, src_w, src_h, zoom, tag):
         # the facecam is enlarged far more than the gameplay, so it gets the stronger clean-up
         cam_fx = (f"hqdn3d=1.5:1.5:4:4,scale={W}:{top}:flags=lanczos,unsharp=5:5:{1.2 * SHARPEN:.2f}:5:5:0"
                   if SHARPEN else f"scale={W}:{top}:flags=lanczos")
+        fs = focus[2] if len(focus) > 2 else 1.0
+        if fs < 1.0:  # a small or soft webcam: enlarge it less, centred on a blurred copy of itself
+            fw, fh = int(W * fs) // 2 * 2, int(top * fs) // 2 * 2
+            cam_fx = (f"split=2[cb{tag}][cf{tag}];[cb{tag}]scale={W}:{top},gblur=sigma=30,eq=brightness=-0.12[cbb{tag}];"
+                      f"[cf{tag}]" + cam_fx.replace(f"scale={W}:{top}", f"scale={fw}:{fh}") +
+                      f",pad={fw + 8}:{fh + 8}:4:4:white[cff{tag}];[cbb{tag}][cff{tag}]overlay=(W-w)/2:(H-h)/2")
         game_fx = (f"hqdn3d=1:1:3:3,scale={W}:{bottom}:flags=lanczos,unsharp=5:5:{0.8 * SHARPEN:.2f}:5:5:0"
                    if SHARPEN else f"scale={W}:{bottom}:flags=lanczos")
         return (f"split=2[ct{tag}][gp{tag}];[ct{tag}]crop={cam[2]}:{cam[3]}:{cam[0]}:{cam[1]},"
@@ -600,7 +608,7 @@ def preview(clip, words, src, src_w, src_h, out_dir):
     sheet.save(path, quality=85)
     kept = [w["w"] for w, r in marked if not r]
     print(f"  clip {clip['id']}: {kind}" + (f" focus_x={focus:.2f}" if kind == "crop" else "")
-          + (f" focus_x={focus[0]:.2f} facecam={focus[1]}" if kind == "split" else "")
+          + (f" focus_x={focus[0]:.2f} facecam={focus[1]} scale={focus[2]}" if kind == "split" else "")
           + f", {length:.1f} s after tightening -> {path}")
     print(f"     starts: \"{' '.join(kept[:8])} ...\"")
     print(f"     ends:   \"... {' '.join(kept[-8:])}\"")
